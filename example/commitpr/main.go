@@ -136,7 +136,7 @@ func pushCommit(ref *github.Reference, tree *github.Tree) (err error) {
 	date := time.Now()
 	author := &github.CommitAuthor{Date: &date, Name: authorName, Email: authorEmail}
 	commit := &github.Commit{Author: author, Message: commitMessage, Tree: tree, Parents: []*github.Commit{parent.Commit}}
-	newCommit, _, err := client.Git.CreateCommit(ctx, *sourceOwner, *sourceRepo, commit)
+	newCommit, _, err := client.Git.CreateCommit(ctx, *sourceOwner, *sourceRepo, commit, nil)
 	if err != nil {
 		return err
 	}

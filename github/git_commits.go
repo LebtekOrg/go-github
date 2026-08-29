@@ -10,10 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/openpgp"
 )
 
 // SignatureVerification represents GPG signature verification.
@@ -22,6 +21,21 @@ type SignatureVerification struct {
 	Reason    *string `json:"reason,omitempty"`
 	Signature *string `json:"signature,omitempty"`
 	Payload   *string `json:"payload,omitempty"`
+}
+
+// MessageSigner signs the canonical message used by GitService.CreateCommit.
+// Keeping the signer abstract avoids forcing every go-github consumer to
+// compile a particular OpenPGP implementation.
+type MessageSigner interface {
+	Sign(w io.Writer, r io.Reader) error
+}
+
+// MessageSignerFunc adapts a function to MessageSigner.
+type MessageSignerFunc func(w io.Writer, r io.Reader) error
+
+// Sign implements MessageSigner.
+func (f MessageSignerFunc) Sign(w io.Writer, r io.Reader) error {
+	return f(w, r)
 }
 
 // Commit represents a GitHub commit.
@@ -42,11 +56,6 @@ type Commit struct {
 	// is only populated for requests that fetch GitHub data like
 	// Pulls.ListCommits, Repositories.ListCommits, etc.
 	CommentCount *int `json:"comment_count,omitempty"`
-
-	// SigningKey denotes a key to sign the commit with. If not nil this key will
-	// be used to sign the commit. The private key must be present and already
-	// decrypted. Ignored if Verification.Signature is defined.
-	SigningKey *openpgp.Entity `json:"-"`
 }
 
 func (c Commit) String() string {
@@ -97,6 +106,13 @@ type createCommit struct {
 	Signature *string       `json:"signature,omitempty"`
 }
 
+// CreateCommitOptions specifies optional commit-signing behavior.
+type CreateCommitOptions struct {
+	// Signer signs the commit when non-nil. Ignored when
+	// Commit.Verification.Signature is already set.
+	Signer MessageSigner
+}
+
 // CreateCommit creates a new commit in a repository.
 // commit must not be nil.
 //
@@ -105,9 +121,12 @@ type createCommit struct {
 // the authenticated user’s information and the current date.
 //
 // GitHub API docs: https://developer.github.com/v3/git/commits/#create-a-commit
-func (s *GitService) CreateCommit(ctx context.Context, owner string, repo string, commit *Commit) (*Commit, *Response, error) {
+func (s *GitService) CreateCommit(ctx context.Context, owner string, repo string, commit *Commit, opts *CreateCommitOptions) (*Commit, *Response, error) {
 	if commit == nil {
 		return nil, nil, fmt.Errorf("commit must be provided")
+	}
+	if opts == nil {
+		opts = &CreateCommitOptions{}
 	}
 
 	u := fmt.Sprintf("repos/%v/%v/git/commits", owner, repo)
@@ -126,15 +145,15 @@ func (s *GitService) CreateCommit(ctx context.Context, owner string, repo string
 	if commit.Tree != nil {
 		body.Tree = commit.Tree.SHA
 	}
-	if commit.SigningKey != nil {
-		signature, err := createSignature(commit.SigningKey, body)
+	switch {
+	case commit.Verification != nil:
+		body.Signature = commit.Verification.Signature
+	case opts.Signer != nil:
+		signature, err := createSignature(opts.Signer, body)
 		if err != nil {
 			return nil, nil, err
 		}
 		body.Signature = &signature
-	}
-	if commit.Verification != nil {
-		body.Signature = commit.Verification.Signature
 	}
 
 	req, err := s.client.NewRequest("POST", u, body)
@@ -151,7 +170,7 @@ func (s *GitService) CreateCommit(ctx context.Context, owner string, repo string
 	return c, resp, nil
 }
 
-func createSignature(signingKey *openpgp.Entity, commit *createCommit) (string, error) {
+func createSignature(signingKey MessageSigner, commit *createCommit) (string, error) {
 	if signingKey == nil || commit == nil {
 		return "", errors.New("createSignature: invalid parameters")
 	}
@@ -162,8 +181,7 @@ func createSignature(signingKey *openpgp.Entity, commit *createCommit) (string, 
 	}
 
 	writer := new(bytes.Buffer)
-	reader := bytes.NewReader([]byte(message))
-	if err := openpgp.ArmoredDetachSign(writer, signingKey, reader, nil); err != nil {
+	if err := signingKey.Sign(writer, strings.NewReader(message)); err != nil {
 		return "", err
 	}
 
