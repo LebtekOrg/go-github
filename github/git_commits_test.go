@@ -9,14 +9,38 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/openpgp"
 )
+
+func mockMessageSigner(t *testing.T, signature, wantMessage string, signErr error) MessageSignerFunc {
+	t.Helper()
+	return func(w io.Writer, r io.Reader) error {
+		message, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		if wantMessage != "" && string(message) != wantMessage {
+			t.Errorf("message to sign = %q, want %q", string(message), wantMessage)
+		}
+		if signErr != nil {
+			return signErr
+		}
+		_, err = io.WriteString(w, signature)
+		return err
+	}
+}
+
+func uncalledMessageSigner(t *testing.T) MessageSignerFunc {
+	t.Helper()
+	return func(io.Writer, io.Reader) error {
+		t.Error("signer should not be called")
+		return nil
+	}
+}
 
 func TestCommit_Marshal(t *testing.T) {
 	testJSONMarshal(t, &Commit{}, "{}")
@@ -65,7 +89,6 @@ func TestCommit_Marshal(t *testing.T) {
 		},
 		NodeID:       String("n"),
 		CommentCount: Int(1),
-		SigningKey:   &openpgp.Entity{},
 	}
 
 	want := `{
@@ -173,7 +196,7 @@ func TestGitService_CreateCommit(t *testing.T) {
 		fmt.Fprint(w, `{"sha":"s"}`)
 	})
 
-	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input)
+	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input, nil)
 	if err != nil {
 		t.Errorf("Git.CreateCommit returned error: %v", err)
 	}
@@ -217,7 +240,7 @@ func TestGitService_CreateSignedCommit(t *testing.T) {
 		fmt.Fprint(w, `{"sha":"commitSha"}`)
 	})
 
-	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input)
+	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input, nil)
 	if err != nil {
 		t.Errorf("Git.CreateCommit returned error: %v", err)
 	}
@@ -231,11 +254,10 @@ func TestGitService_CreateSignedCommitWithInvalidParams(t *testing.T) {
 	client, _, _, teardown := setup()
 	defer teardown()
 
-	input := &Commit{
-		SigningKey: &openpgp.Entity{},
-	}
+	input := &Commit{}
+	opts := &CreateCommitOptions{Signer: uncalledMessageSigner(t)}
 
-	_, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input)
+	_, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input, opts)
 	if err == nil {
 		t.Errorf("Expected error to be returned because invalid params was passed")
 	}
@@ -244,11 +266,6 @@ func TestGitService_CreateSignedCommitWithInvalidParams(t *testing.T) {
 func TestGitService_CreateSignedCommitWithKey(t *testing.T) {
 	client, mux, _, teardown := setup()
 	defer teardown()
-	s := strings.NewReader(testGPGKey)
-	keyring, err := openpgp.ReadArmoredKeyRing(s)
-	if err != nil {
-		t.Errorf("Error reading keyring: %+v", err)
-	}
 
 	date, _ := time.Parse("Mon Jan 02 15:04:05 2006 -0700", "Thu May 04 00:03:43 2017 +0200")
 	author := CommitAuthor{
@@ -256,20 +273,20 @@ func TestGitService_CreateSignedCommitWithKey(t *testing.T) {
 		Email: String("go-github@github.com"),
 		Date:  &date,
 	}
-	input := &Commit{
-		Message:    String("Commit Message."),
-		Tree:       &Tree{SHA: String("t")},
-		Parents:    []*Commit{{SHA: String("p")}},
-		SigningKey: keyring[0],
-		Author:     &author,
-	}
-
-	messageReader := strings.NewReader(`tree t
+	wantMessage := `tree t
 parent p
 author go-github <go-github@github.com> 1493849023 +0200
 committer go-github <go-github@github.com> 1493849023 +0200
 
-Commit Message.`)
+Commit Message.`
+	signature := "test signature"
+	input := &Commit{
+		Message: String("Commit Message."),
+		Tree:    &Tree{SHA: String("t")},
+		Parents: []*Commit{{SHA: String("p")}},
+		Author:  &author,
+	}
+	opts := &CreateCommitOptions{Signer: mockMessageSigner(t, signature, wantMessage, nil)}
 
 	mux.HandleFunc("/repos/o/r/git/commits", func(w http.ResponseWriter, r *http.Request) {
 		v := new(createCommit)
@@ -278,29 +295,19 @@ Commit Message.`)
 		testMethod(t, r, "POST")
 
 		want := &createCommit{
-			Message: input.Message,
-			Tree:    String("t"),
-			Parents: []string{"p"},
-			Author:  &author,
+			Message:   input.Message,
+			Tree:      String("t"),
+			Parents:   []string{"p"},
+			Author:    &author,
+			Signature: String(signature),
 		}
-
-		sigReader := strings.NewReader(*v.Signature)
-		signer, err := openpgp.CheckArmoredDetachedSignature(keyring, messageReader, sigReader)
-		if err != nil {
-			t.Errorf("Error verifying signature: %+v", err)
-		}
-		if signer.Identities["go-github <go-github@github.com>"].Name != "go-github <go-github@github.com>" {
-			t.Errorf("Signer is incorrect. got: %+v, want %+v", signer.Identities["go-github <go-github@github.com>"].Name, "go-github <go-github@github.com>")
-		}
-		// Nullify Signature since we checked it above
-		v.Signature = nil
 		if !reflect.DeepEqual(v, want) {
 			t.Errorf("Request body = %+v, want %+v", v, want)
 		}
 		fmt.Fprint(w, `{"sha":"commitSha"}`)
 	})
 
-	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input)
+	commit, _, err := client.Git.CreateCommit(context.Background(), "o", "r", input, opts)
 	if err != nil {
 		t.Errorf("Git.CreateCommit returned error: %v", err)
 	}
@@ -326,7 +333,7 @@ func TestGitService_createSignature_nilSigningKey(t *testing.T) {
 }
 
 func TestGitService_createSignature_nilCommit(t *testing.T) {
-	_, err := createSignature(&openpgp.Entity{}, nil)
+	_, err := createSignature(uncalledMessageSigner(t), nil)
 
 	if err == nil {
 		t.Errorf("Expected error to be returned because no author was passed")
@@ -340,7 +347,7 @@ func TestGitService_createSignature_noAuthor(t *testing.T) {
 		Parents: []string{"p"},
 	}
 
-	_, err := createSignature(&openpgp.Entity{}, a)
+	_, err := createSignature(uncalledMessageSigner(t), a)
 
 	if err == nil {
 		t.Errorf("Expected error to be returned because no author was passed")
@@ -350,7 +357,7 @@ func TestGitService_createSignature_noAuthor(t *testing.T) {
 func TestGitService_createSignature_invalidKey(t *testing.T) {
 	date, _ := time.Parse("Mon Jan 02 15:04:05 2006 -0700", "Thu May 04 00:03:43 2017 +0200")
 
-	_, err := createSignature(&openpgp.Entity{}, &createCommit{
+	_, err := createSignature(mockMessageSigner(t, "", "", fmt.Errorf("signer failed")), &createCommit{
 		Message: String("Commit Message."),
 		Tree:    String("t"),
 		Parents: []string{"p"},
@@ -471,7 +478,7 @@ func TestGitService_CreateCommit_invalidOwner(t *testing.T) {
 	client, _, _, teardown := setup()
 	defer teardown()
 
-	_, _, err := client.Git.CreateCommit(context.Background(), "%", "%", &Commit{})
+	_, _, err := client.Git.CreateCommit(context.Background(), "%", "%", &Commit{}, nil)
 	testURLParseError(t, err)
 }
 

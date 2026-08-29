@@ -301,7 +301,7 @@ func TestNewRequest_invalidJSON(t *testing.T) {
 	c := NewClient(nil)
 
 	type T struct {
-		A map[interface{}]interface{}
+		F func()
 	}
 	_, err := c.NewRequest("GET", ".", &T{})
 
